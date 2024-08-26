@@ -1,0 +1,429 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Infraestructura con CloudFront, S3, API Gateway, Lambda y DynamoDB
+
+Parameters:
+  VpcEndpointSgId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security Group asociado para los VPC Endpoints
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Lista de Subnets en las que la función Lambda se desplegará
+  S3WebBucketName:
+    Type: String
+    Description: "Nombre del bucket de S3 donde se servirá el CloudFront Website"
+  StageName:
+    Type: String
+    Description: "Nombre del stage en API Gateway y el path en CloudFront"
+
+Resources:
+  ## DynamoDB Table
+  DynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: productos
+      AttributeDefinitions:
+        - AttributeName: Id
+          AttributeType: N
+        - AttributeName: Nombre
+          AttributeType: S
+      KeySchema:
+        - AttributeName: Id
+          KeyType: HASH
+        - AttributeName: Nombre
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+      Tags:
+        - Key: lm_troux_uid
+          Value: "123"
+
+  ## S3 Bucket
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3WebBucketName
+      AccessControl: Private
+      Tags:
+        - Key: Name
+          Value: !Ref S3WebBucketName
+        - Key: lm_troux_uid
+          Value: "123"
+
+  ## Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Tags:
+        - Key: lm_troux_uid
+          Value: "123"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaS3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${S3WebBucketName}/*"
+                  - !Sub "arn:aws:s3:::${S3WebBucketName}"
+        - PolicyName: LambdaDynamoDBAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:Query"
+                  - "dynamodb:Scan"
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DynamoDBTable}"
+        - PolicyName: LambdaEC2NetworkInterfaceAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                Resource: "*"
+
+  ## Lambda Functions
+  
+  ListarS3Function:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ListarS3
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+          import json
+          def handler(event, context):
+              s3 = boto3.client('s3')
+              bucket_name = os.environ['S3_BUCKET_NAME']
+              response = s3.list_objects_v2(Bucket=bucket_name)
+              results = [element['Key'] for element in response.get('Contents', [])]
+              return {
+                'statusCode': 200,
+                'headers': {
+                    'Content-Type': 'application/json'
+                },
+                'body': json.dumps(results)
+              }
+      Runtime: python3.9
+      MemorySize: 128
+      Timeout: 30
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref VpcEndpointSgId
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          S3_BUCKET_NAME: !Ref S3WebBucketName
+      Tags:
+        - Key: lm_troux_uid
+          Value: "123"
+
+  ListarDynamoFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ListarDynamo
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+          import json
+          from decimal import Decimal
+
+          def convert_decimal_to_int(item):
+            for key, value in item.items():
+                if isinstance(value, list):
+                    item[key] = [convert_decimal_to_int(i) if isinstance(i, dict) else (int(i) if isinstance(i, Decimal) else i) for i in value]
+                elif isinstance(value, dict):
+                    item[key] = convert_decimal_to_int(value)
+                elif isinstance(value, Decimal):
+                    item[key] = int(value)
+            return item
+
+          def handler(event, context):
+            dynamodb = boto3.resource('dynamodb')
+            table_name = os.environ['DYNAMO_TABLE_NAME']
+            table = dynamodb.Table(table_name)
+            response = table.scan()
+            items = [convert_decimal_to_int(item) for item in response.get('Items', [])]
+
+            return {
+                'statusCode': 200,
+                'headers': {
+                    'Content-Type': 'application/json'
+                },
+                'body': json.dumps(items)
+            }
+      Runtime: python3.9
+      MemorySize: 128
+      Timeout: 30
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref VpcEndpointSgId
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          DYNAMO_TABLE_NAME: !Ref DynamoDBTable
+      Tags:
+        - Key: lm_troux_uid
+          Value: "123"
+
+  ## API Gateway
+
+  ApiGatewayRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: ApiGatewayLambdas
+      ApiKeySourceType: HEADER
+      Tags:
+        - Key: lm_troux_uid
+          Value: "123"
+
+  ApiGatewayV1Resource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGatewayRestApi.RootResourceId
+      PathPart: v1
+      RestApiId: !Ref ApiGatewayRestApi
+
+  ApiGatewayListItemsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !Ref ApiGatewayV1Resource
+      PathPart: "list-items"
+      RestApiId: !Ref ApiGatewayRestApi
+
+  ApiGatewayListFilesResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !Ref ApiGatewayV1Resource
+      PathPart: "list-files"
+      RestApiId: !Ref ApiGatewayRestApi
+
+  ApiGatewayMethodGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: GET
+      ResourceId: !Ref ApiGatewayListItemsResource
+      RestApiId: !Ref ApiGatewayRestApi
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ListarDynamoFunction.Arn}/invocations"
+
+  ApiGatewayMethodPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: POST
+      ResourceId: !Ref ApiGatewayListFilesResource
+      RestApiId: !Ref ApiGatewayRestApi
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ListarS3Function.Arn}/invocations"
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      StageName: !Ref StageName
+    DependsOn:
+      - ApiGatewayMethodGet
+      - ApiGatewayMethodPost
+
+  ApiGatewayUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn:
+      - ApiGatewayDeployment
+    Properties:
+      Description: Usage Plan for Amantium test
+      Tags:
+        - Key: lm_troux_uid
+          Value: "123"
+      ApiStages:
+        - ApiId: !Ref ApiGatewayRestApi
+          Stage: !Ref StageName
+      Quota:
+        Limit: 1000
+        Period: MONTH
+      Throttle:
+        RateLimit: 100.0
+        BurstLimit: 200
+      UsagePlanName: "Amantium Usage Plan"
+
+  ApiGatewayApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Description: API Key
+      Name: ApiGatewayApiKey
+      Enabled: True
+      Tags:
+        - Key: lm_troux_uid
+          Value: "123"
+
+  ApiGatewayUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiGatewayApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref ApiGatewayUsagePlan
+
+  ## Lambda Permissions
+
+  ListarDynamoInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ListarDynamoFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGatewayRestApi}/*/GET/v1/list-items"
+
+  ListarS3InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ListarS3Function.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGatewayRestApi}/*/POST/v1/list-files"
+
+  ## CloudFront
+
+  CloudFrontOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Description: "Origin access control (OAC) for allowing CloudFront to access S3 bucket"
+        Name: !Sub "${S3WebBucketName}-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      Tags:
+        - Key: lm_troux_uid
+          Value: "123"
+      DistributionConfig:
+        Origins:
+          - Id: S3Origin
+            DomainName: !Sub "${S3WebBucketName}.s3.${AWS::Region}.amazonaws.com"
+            S3OriginConfig: {}
+            OriginAccessControlId: !GetAtt CloudFrontOriginAccessControl.Id
+          - Id: ApiGatewayOrigin
+            DomainName: !Sub "${ApiGatewayRestApi}.execute-api.${AWS::Region}.amazonaws.com"
+            OriginPath: !Sub "/${StageName}"
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+        Enabled: true
+        DefaultRootObject: index.html
+        IPV6Enabled: false
+        HttpVersion: http2
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+        CacheBehaviors:
+          - AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+              - PUT
+              - POST
+              - PATCH
+              - DELETE
+            CachedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+            Compress: true
+            ForwardedValues:
+              QueryString: true
+              Cookies:
+                Forward: none
+              Headers:
+                - Accept
+                - Referer
+                - Authorization
+                - Content-Type
+                - X-API-Key
+            PathPattern: "/v1/*"
+            TargetOriginId: ApiGatewayOrigin
+            ViewerProtocolPolicy: redirect-to-https
+
+
+  ## S3 Bucket Policy
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipal
+            Action: s3:GetObject
+            Effect: Allow
+            Resource: !Sub "arn:aws:s3:::${S3WebBucketName}/*"
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+          - Sid: AllowLambdaAccess
+            Action: s3:GetObject
+            Effect: Allow
+            Resource: !Sub "arn:aws:s3:::${S3WebBucketName}/*"
+            Principal:
+              AWS: !GetAtt LambdaExecutionRole.Arn
+
+Outputs:
+  S3Bucket:
+    Value: !Ref S3Bucket
+    Description: Data Source S3 Name
+  DynamoDBTable:
+    Value: !Ref DynamoDBTable
+    Description: Data Source DynamoDB Table
+  S3WebsiteUrl:
+    Value: !GetAtt S3Bucket.WebsiteURL
+    Description: S3 Website URL
+  ApiRootUrl:
+    Description: Root URL of the API
+    Value: !Sub "https://${ApiGatewayRestApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}"
+  CloudFrontID:
+    Value: !Ref CloudFrontDistribution
+    Description: CloudFront ID
+  CloudFrontDomainName:
+    Value: !Sub "https://${CloudFrontDistribution.DomainName}"
+    Description: URL del dominio CloudFront

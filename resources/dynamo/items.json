@@ -1,0 +1,4 @@
+[
+  { "Id": { "N": "1" }, "Nombre": { "S": "Tomate" }, "Cantidad": { "N": "10" } },
+  { "Id": { "N": "2" }, "Nombre": { "S": "Cebolla" }, "Cantidad": { "N": "5" } }
+]
